@@ -1,40 +1,14 @@
-# variance_profile_plot.py
-#
-# Plot variance profiles of Fourier coefficients a_ω(θ) vs frequency ω.
-#
-# Reads .npz files produced by correlation_compute.py or correlation_matrices_compute.py,
-# using:
-#   - var_C   : predicted variance profile — diagonal of Cov_C = C_nz C_nz†
-#   - var_MC  : Monte Carlo variance profile — diagonal of empirical Cov_MC
-#   - omega_grid
-#   - diag_json (optional diagnostics and block-bootstrap SEs)
-#
-# The variance profile Var[a_ω] captures the spectral energy distribution of the circuit
-# across output frequencies ω. The C-matrix prediction (var_C) should match the direct
-# Monte Carlo estimate (var_MC) when the C-matrix is well-estimated.
-#
-# Plot modes:
-#   raw    : raw variances
-#   norm   : profile / sum(profile)        — normalised spectral weight
-#   relmax : profile / max(profile)        — relative-to-max profile
-#   logrel : log10(profile / max(profile)) — log-scale relative profile
-#
-# Per-frequency bootstrap SEs (var_C_se, var_MC_se) are plotted as error bars
-# if present in the .npz file; otherwise profiles are plotted without error bars.
-#
-# Usage:
-#   python variance_profile_plot.py \
-#       --indir outputs_correlation_matrices \
-#       --outdir figures_variance_profiles \
-#       --mode relmax
-#
-#   python variance_profile_plot.py \
-#       --indir outputs_correlation_matrices \
-#       --outdir figures_variance_profiles \
-#       --mode logrel \
-#       --omega_phys 6
-#
-# Requirements: numpy, matplotlib
+#!/usr/bin/env python3
+"""Plot CHM Fourier-coefficient variance profiles.
+
+The script reads the ``.npz`` files produced by
+``twirled_correlation_matrices_compute.py`` and plots ``var_C``/``var_TW``
+against the optional Monte Carlo estimate ``var_MC``.  The variance profile
+shows how the circuit distributes coefficient energy across output frequencies.
+
+Available plot modes are raw variance, normalised spectral weight, variance
+relative to the maximum, and log10 variance relative to the maximum.
+"""
 
 import os
 import glob
@@ -425,7 +399,7 @@ def write_csv_summary(rows, out_csv, mode="relmax", omega_phys=None, omega_side=
 
 def parse_args():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--indir", type=str, required=True, help="Directory containing .npz files from correlation_compute.py or correlation_matrices_compute.py.")
+    ap.add_argument("--indir", type=str, required=True, help="Directory containing .npz files from twirled_correlation_matrices_compute.py.")
     ap.add_argument("--outdir", type=str, required=True, help="Output directory for figures + CSV.")
     ap.add_argument("--pattern", type=str, default="*.npz", help="Glob pattern for .npz files.")
 

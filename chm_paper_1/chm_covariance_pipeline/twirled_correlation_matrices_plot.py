@@ -1,29 +1,16 @@
-# correlation_matrices_plot.py
-#
-# Visualise the Fourier-coefficient correlation matrices Corr_C and Corr_MC
-# as heatmaps, for a sequence of training depths from a single compute run.
-#
-# For each .npz file produced by correlation_matrices_compute.py, this script
-# plots three heatmap grids:
-#   - Re(Corr)  : real part of the correlation matrix
-#   - Im(Corr)  : imaginary part
-#   - |Corr|    : absolute value (magnitude)
-# Each grid shows one column per training depth, with two rows:
-#   row 0: C-matrix prediction (Corr_C)
-#   row 1: Direct Monte Carlo estimate (Corr_MC)
-# A textbox below each column shows scalar diagnostics (Frobenius error,
-# cosine similarity of off-diagonal entries, and mean off-diagonal correlation).
-#
-# Optional variance-support masking:
-#   --mask_support: zero out entries (ω,ω') where Var[a_ω] or Var[a_ω'] falls
-#   below a threshold fraction of the maximum variance. This focuses the plot
-#   on frequency pairs that actually carry spectral weight.
-#
-# Usage:
-#   python correlation_matrices_plot.py --indir outputs_correlation_matrices --outdir figures_correlation_matrices
-#   python correlation_matrices_plot.py --indir outputs_correlation_matrices --outdir figures_correlation_matrices --mask_support --support_threshold 0.01
-#
-# Requirements: numpy, matplotlib
+#!/usr/bin/env python3
+"""Plot CHM Fourier-coefficient covariance and correlation heatmaps.
+
+The input files are produced by ``twirled_correlation_matrices_compute.py``.
+For each run the script compares the exact two-copy twirled result against the
+optional Monte Carlo estimate and writes real-part, imaginary-part, and absolute
+correlation heatmap grids.
+
+Variance-support masking is enabled by default.  Frequencies whose exact
+variance is numerically zero are masked before correlation normalisation is
+visualised, preventing Monte Carlo round-off in unsupported modes from dominating
+the colour scale.  Use ``--no_support_mask`` to inspect the raw matrices.
+"""
 
 import os
 import glob
@@ -50,7 +37,7 @@ def load_npz_strict(path):
     if missing:
         raise KeyError(
             f"[ERROR] {os.path.basename(path)} is missing required keys: {missing}\n"
-            "This script assumes hermitian-only files produced by correlation_matrices_compute.py."
+            "This script assumes hermitian-only files produced by twirled_correlation_matrices_compute.py."
         )
 
     meta = {}
@@ -127,6 +114,93 @@ def cosine_similarity(u, v, eps=1e-14):
     den = (np.linalg.norm(u) * np.linalg.norm(v) + eps)
     return float(np.real(num / den))
 
+def corr_from_cov(Cov, eps=1e-14):
+    """Correlation matrix and variances from a Hermitian covariance.
+
+    Mirrors the convention in twirled_correlation_matrices_compute.py: modes with
+    numerically zero variance are left with zero correlation rows/cols.
+    """
+    Cov = np.asarray(Cov, dtype=np.complex128)
+    var = np.real(np.diag(Cov)).astype(np.float64)
+    denom = np.sqrt(np.maximum(var, 0.0))
+    Corr = np.zeros_like(Cov)
+    good = denom > eps
+    if np.any(good):
+        Corr[np.ix_(good, good)] = Cov[np.ix_(good, good)] / np.outer(denom[good], denom[good])
+    return Corr, var
+
+def whiten_unit_diagonal(M, thresh=0.5):
+    """Set unit (|value|>thresh) diagonal entries to NaN for display.
+
+    With cmap.set_bad('white') this renders the correlation diagonal as white so
+    it is visibly off the off-diagonal colour scale, rather than clamping to the
+    top colour and being confused with a large off-diagonal. Unsupported modes
+    (diagonal 0) are left untouched so they keep the zero colour.
+    """
+    M = np.array(M, copy=True)
+    d = np.abs(np.diag(M))
+    for i in np.where(d > thresh)[0]:
+        M[i, i] = np.nan
+    return M
+
+def bootstrap_metric_se(samples, keep_mask, support_mask, A_C_part_ref, part,
+                        n_boot, seed, eps=1e-14):
+    """Bootstrap Monte-Carlo standard errors for the MC-vs-analytic metrics.
+
+    Resamples the theta draws with replacement, recomputes the MC correlation,
+    applies the same support mask used for display, and compares against the
+    exact analytic reference A_C_part_ref (same part, same mask). Returns the
+    standard errors (frob_err, offdiag_cosine, mean_abs_offdiag_MC). The analytic
+    C side carries no sampling error, so its mean|offdiag| SE is reported as NaN
+    by the caller.
+    """
+    if samples is None:
+        return np.nan, np.nan, np.nan
+    A = np.asarray(samples)
+    if A.ndim != 2 or A.shape[0] < 2 or int(n_boot) < 2:
+        return np.nan, np.nan, np.nan
+    keep = np.asarray(keep_mask, dtype=bool)
+    A = A[:, keep]
+    S = A.shape[0]
+
+    def _part(M):
+        if part == "real":
+            return np.real(M)
+        if part == "imag":
+            return np.imag(M)
+        return np.abs(M)
+
+    def _apply_support(M):
+        if support_mask is None:
+            return M
+        bad = ~np.asarray(support_mask, dtype=bool)
+        M = np.array(M, copy=True)
+        M[bad, :] = np.nan
+        M[:, bad] = np.nan
+        return M
+
+    rng = np.random.default_rng(int(seed))
+    frob = np.empty(int(n_boot))
+    cosv = np.empty(int(n_boot))
+    moff = np.empty(int(n_boot))
+    for b in range(int(n_boot)):
+        idx = rng.integers(0, S, size=S)
+        Ab = A[idx]
+        mean = np.mean(Ab, axis=0)
+        Ac = Ab - mean[None, :]
+        Cov = (Ac.T @ Ac.conj()) / float(S)
+        Cov = 0.5 * (Cov + Cov.conj().T)
+        Corr_b, _ = corr_from_cov(Cov, eps=eps)
+        P = _apply_support(_part(Corr_b))
+        frob[b] = rel_frob(P, A_C_part_ref)
+        cosv[b] = cosine_similarity(offdiag_vector(P), offdiag_vector(A_C_part_ref))
+        moff[b] = mean_abs_offdiag(P, use_abs=True)
+
+    def _se(x):
+        x = x[np.isfinite(x)]
+        return float(np.std(x, ddof=1)) if x.size > 1 else np.nan
+    return _se(frob), _se(cosv), _se(moff)
+
 
 # -------------------------
 # Omega restriction helpers
@@ -168,32 +242,46 @@ def restrict_vector_list(v_list, omega_grid, keep_mask):
 # -------------------------
 
 def relative_support_mask(var_vec, rel_thresh):
+    """Return modes with variance above a relative floor.
+
+    This is deliberately based on variance support, not on the already-normalised
+    correlation entries. Correlation divides by sqrt(var_i var_j), so tiny MC
+    numerical variances in truly unsupported modes can otherwise appear as large
+    spurious correlations.
+    """
     v = np.asarray(var_vec, dtype=np.float64)
-    vmax = float(np.max(v)) if v.size else 0.0
+    finite = np.isfinite(v)
+    if not np.any(finite):
+        return np.zeros_like(v, dtype=bool)
+    vmax = float(np.nanmax(np.maximum(v[finite], 0.0)))
     if vmax <= 0.0:
         return np.zeros_like(v, dtype=bool)
-    return (v / vmax) > float(rel_thresh)
+    return finite & ((np.maximum(v, 0.0) / vmax) > float(rel_thresh))
 
 def combine_support_masks(mask_c, mask_mc, mode):
     if mode == "intersection":
         return mask_c & mask_mc
     if mode == "union":
         return mask_c | mask_mc
-    if mode == "c":
+    if mode in {"c", "twirled", "exact"}:
         return mask_c
     if mode == "mc":
         return mask_mc
-    raise ValueError("support_mode must be one of {'intersection','union','c','mc'}")
+    raise ValueError("support_mode must be one of {'intersection','union','c','twirled','exact','mc'}")
 
-def apply_support_mask_matrix(A, support_mask):
+def apply_support_mask_matrix(A, support_mask, fill_value=np.nan):
     """
-    Mask rows/cols outside support with NaN for display/metrics.
+    Replace rows/cols outside support with a chosen fill value.
+
+    Use fill_value=np.nan for metric computations so unsupported entries are
+    ignored, and fill_value=0.0 for display so unsupported entries appear with
+    the same colour as zero rather than as white masked boxes.
     """
     A = np.array(A, copy=True)
     bad = ~np.asarray(support_mask, dtype=bool)
     if np.any(bad):
-        A[bad, :] = np.nan
-        A[:, bad] = np.nan
+        A[bad, :] = fill_value
+        A[:, bad] = fill_value
     return A
 
 
@@ -316,13 +404,17 @@ def plot_grid_figure_hermitian(
     mask_diag="none",
     support_rel_var=None,
     support_mode="intersection",
+    unit_diag_white=True,
+    n_bootstrap=200,
+    bootstrap_seed=0,
+    col_label="depth",
 ):
     assert part in ("real", "imag", "abs")
     assert omega_side in ("all", "nonneg", "nonpos")
     assert mask_diag in ("none", "zero", "nan")
 
-    depths = [r["depth"] for r in rows_by_depth]
-    ncols = len(depths)
+    col_values = [r.get("col_value", r.get("depth")) for r in rows_by_depth]
+    ncols = len(col_values)
 
     Corr_C0  = [r["Corr_C"]  for r in rows_by_depth]
     Corr_MC0 = [r["Corr_MC"] for r in rows_by_depth]
@@ -333,20 +425,25 @@ def plot_grid_figure_hermitian(
         A_C_raw0  = [np.real(A) for A in Corr_C0]
         A_MC_raw0 = [np.real(A) for A in Corr_MC0]
         part_label = "Re"
-        cmap = "coolwarm"
+        cmap_name = "coolwarm"
         diverging = True
     elif part == "imag":
         A_C_raw0  = [np.imag(A) for A in Corr_C0]
         A_MC_raw0 = [np.imag(A) for A in Corr_MC0]
         part_label = "Im"
-        cmap = "coolwarm"
+        cmap_name = "coolwarm"
         diverging = True
     else:
         A_C_raw0  = [np.abs(A) for A in Corr_C0]
         A_MC_raw0 = [np.abs(A) for A in Corr_MC0]
-        part_label = "|.|"
-        cmap = "viridis"
+        part_label = "Abs"
+        cmap_name = "viridis"
         diverging = False
+
+    # Colormap copy with a white "bad" colour so the whitened unit diagonal
+    # renders white, distinct from the off-diagonal colour scale.
+    cmap = matplotlib.colormaps[cmap_name].copy()
+    cmap.set_bad("white")
 
     # Restrict omega consistently
     keep = omega_side_mask(omega_grid, omega_side) & omega_phys_mask(omega_grid, omega_phys)
@@ -362,25 +459,40 @@ def plot_grid_figure_hermitian(
     if support_rel_var is not None:
         A_C_masked = []
         A_MC_masked = []
+        A_C_disp_base = []
+        A_MC_disp_base = []
         for j in range(ncols):
             mC = relative_support_mask(var_C_r[j], support_rel_var)
             mM = relative_support_mask(var_MC_r[j], support_rel_var)
             ms = combine_support_masks(mC, mM, support_mode)
             support_masks.append(ms)
-            A_C_masked.append(apply_support_mask_matrix(A_C_raw[j], ms))
-            A_MC_masked.append(apply_support_mask_matrix(A_MC_raw[j], ms))
+            # Keep NaN-filled versions for metric computations so unsupported
+            # entries are excluded from Frobenius/cosine/off-diagonal stats.
+            A_C_masked.append(apply_support_mask_matrix(A_C_raw[j], ms, fill_value=np.nan))
+            A_MC_masked.append(apply_support_mask_matrix(A_MC_raw[j], ms, fill_value=np.nan))
+            # Keep zero-filled versions for display so unsupported entries use
+            # the zero colour rather than appearing as white masked boxes.
+            A_C_disp_base.append(apply_support_mask_matrix(A_C_raw[j], ms, fill_value=0.0))
+            A_MC_disp_base.append(apply_support_mask_matrix(A_MC_raw[j], ms, fill_value=0.0))
         A_C_raw = A_C_masked
         A_MC_raw = A_MC_masked
     else:
         support_masks = [None] * ncols
+        A_C_disp_base = [np.array(A, copy=True) for A in A_C_raw]
+        A_MC_disp_base = [np.array(A, copy=True) for A in A_MC_raw]
 
     # Display mask (display-only)
     if mask_diag == "none":
-        A_C_disp  = [np.array(A, copy=True) for A in A_C_raw]
-        A_MC_disp = [np.array(A, copy=True) for A in A_MC_raw]
+        A_C_disp  = [np.array(A, copy=True) for A in A_C_disp_base]
+        A_MC_disp = [np.array(A, copy=True) for A in A_MC_disp_base]
     else:
-        A_C_disp  = [mask_diagonal_for_display(A, mode=mask_diag) for A in A_C_raw]
-        A_MC_disp = [mask_diagonal_for_display(A, mode=mask_diag) for A in A_MC_raw]
+        A_C_disp  = [mask_diagonal_for_display(A, mode=mask_diag) for A in A_C_disp_base]
+        A_MC_disp = [mask_diagonal_for_display(A, mode=mask_diag) for A in A_MC_disp_base]
+
+    # Render the unit correlation diagonal as white (off the off-diagonal scale).
+    if unit_diag_white:
+        A_C_disp  = [whiten_unit_diagonal(A) for A in A_C_disp]
+        A_MC_disp = [whiten_unit_diagonal(A) for A in A_MC_disp]
 
     # Color scaling
     if diverging:
@@ -391,8 +503,14 @@ def plot_grid_figure_hermitian(
         vmin = 0.0
 
     # Layout
-    fig_h = 7.2
-    fig_w = max(8.0, 3.0 * ncols)
+    if ncols == 1:
+        # Compact, square-celled panel suitable for inclusion as a small figure.
+        fig_w, fig_h = 4.6, 8.2
+        imshow_aspect = "equal"
+    else:
+        fig_h = 7.2
+        fig_w = max(8.0, 3.0 * ncols)
+        imshow_aspect = "auto"
     fig, axes = plt.subplots(
         3, ncols, figsize=(fig_w, fig_h),
         gridspec_kw={"height_ratios": [1.0, 1.0, 0.48]},
@@ -405,7 +523,8 @@ def plot_grid_figure_hermitian(
     band_note = f", |ω|≤{int(omega_phys)}" if omega_phys is not None else ""
     supp_note = ""
     if support_rel_var is not None:
-        supp_note = f", support>{support_rel_var:.0e} ({support_mode})"
+        mode_label = {"c": "twirled", "exact": "twirled", "twirled": "twirled", "mc": "MC"}.get(support_mode, support_mode)
+        supp_note = f", support>{support_rel_var:.0e}"
 
     fig.suptitle(
         f"Hermitian Corr(a) | {title_prefix} | {part_label} | {side_note}{band_note}{supp_note}",
@@ -417,24 +536,24 @@ def plot_grid_figure_hermitian(
     # Metrics fallback computed from masked meaningful matrices
     fb_errs, fb_cos, fb_mean_offdiag_C, fb_mean_offdiag_M = _fallback_metrics_complex_parts(A_C_raw, A_MC_raw)
 
-    for j, depth in enumerate(depths):
+    for j, col_value in enumerate(col_values):
         ax0 = axes[0, j]
         im0 = ax0.imshow(
-            np.ma.masked_invalid(A_C_disp[j]),
-            origin="lower", aspect="auto",
+            A_C_disp[j],
+            origin="lower", aspect=imshow_aspect,
             vmin=vmin, vmax=vmax, cmap=cmap
         )
-        ax0.set_title(f"depth={depth} | {part_label} | C")
+        ax0.set_title(f"{col_label}={col_value} | {part_label} | Analytical")
         set_omega_ticks(ax0, omega_grid_r)
         ims.append(im0)
 
         ax1 = axes[1, j]
         im1 = ax1.imshow(
-            np.ma.masked_invalid(A_MC_disp[j]),
-            origin="lower", aspect="auto",
+            A_MC_disp[j],
+            origin="lower", aspect=imshow_aspect,
             vmin=vmin, vmax=vmax, cmap=cmap
         )
-        ax1.set_title(f"depth={depth} | {part_label} | MC")
+        ax1.set_title(f"{col_label}={col_value} | {part_label} | Monte Carlo")
         set_omega_ticks(ax1, omega_grid_r)
         ims.append(im1)
 
@@ -446,9 +565,20 @@ def plot_grid_figure_hermitian(
         mean_offdiag_C_mean = fb_mean_offdiag_C[j]; mean_offdiag_C_se = np.nan
         mean_offdiag_M_mean = fb_mean_offdiag_M[j]; mean_offdiag_M_se = np.nan
 
-        # Prefer diag_json only when no support masking is applied.
-        # Once support masking is applied, the fallback metrics are the relevant ones.
-        if (support_rel_var is None) and isinstance(diag, dict) and diag:
+        # Preferred: bootstrap Monte-Carlo standard errors from the raw samples,
+        # applying the same support mask so the +- matches the displayed metrics.
+        samples_j = rows_by_depth[j].get("samples_MC", None)
+        have_boot = (samples_j is not None) and (int(n_bootstrap) >= 2)
+        if have_boot:
+            err_se, cos_se, mean_offdiag_M_se = bootstrap_metric_se(
+                samples_j, keep, support_masks[j], A_C_raw[j], part,
+                int(n_bootstrap), int(bootstrap_seed) + j,
+            )
+            mean_offdiag_C_se = np.nan  # analytic twirl is exact: no sampling error
+
+        # Fall back to a stored diag_json SE schema only when there are no raw
+        # samples to bootstrap and no support masking is applied.
+        if (not have_boot) and (support_rel_var is None) and isinstance(diag, dict) and diag:
             if part in ("real", "imag"):
                 parts = _dig(diag, "complex", "parts", default=None)
                 group = "complex_re" if part == "real" else "complex_im"
@@ -523,7 +653,7 @@ def plot_grid_figure_hermitian(
 
 def parse_args():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--indir", type=str, required=True, help="Directory containing .npz files from correlation_matrices_compute.py.")
+    ap.add_argument("--indir", type=str, required=True, help="Directory containing .npz files from twirled_correlation_matrices_compute.py.")
     ap.add_argument("--pattern", type=str, default="*.npz", help="Glob pattern inside indir.")
     ap.add_argument("--outdir", type=str, default=None, help="Output directory (default: indir/plots_covcorrH_grid).")
     ap.add_argument("--clip_q", type=float, default=0.995, help="Quantile for off-diagonal color scaling.")
@@ -545,18 +675,37 @@ def parse_args():
     ap.add_argument(
         "--support_rel_var",
         type=float,
-        default=None,
+        default=1e-10,
         help="Relative variance threshold for defining omega-support. "
-             "Modes with var/max(var) <= threshold are masked out. Example: 1e-3",
+             "Modes with var/max(var) <= threshold are masked out. "
+             "Default: 1e-10, which removes numerically unsupported modes.",
     )
     ap.add_argument(
         "--support_mode",
         type=str,
-        default="intersection",
-        choices=["intersection", "union", "c", "mc"],
-        help="How to combine C-side and MC-side support masks.",
+        default="c",
+        choices=["intersection", "union", "c", "twirled", "exact", "mc"],
+        help="How to define support. Default 'c' means exact/twirled support; "
+             "this is usually the correct choice for masking MC noise outside true Fourier support.",
     )
-    return ap.parse_args()
+    ap.add_argument(
+        "--no_support_mask",
+        action="store_true",
+        help="Disable variance-support masking and plot raw correlations, including MC noise in near-zero-variance modes.",
+    )
+    ap.add_argument("--column_axis", type=str, default="depth", choices=["depth", "layers"],
+                    help="Which swept quantity varies across the figure columns. 'depth' holds n_layers fixed; 'layers' holds train_depth fixed.")
+    ap.add_argument("--n_bootstrap", type=int, default=200,
+                    help="Bootstrap resamples for Monte-Carlo error bars on the metrics (needs samples_MC in the .npz). 0 disables.")
+    ap.add_argument("--bootstrap_seed", type=int, default=0, help="Base seed for the metric bootstrap.")
+    ap.add_argument("--unit_diag_white", dest="unit_diag_white", action="store_true", default=True,
+                    help="Render the unit correlation diagonal as white, off the off-diagonal colour scale (default: on).")
+    ap.add_argument("--no_unit_diag_white", dest="unit_diag_white", action="store_false",
+                    help="Keep the diagonal on the colour scale.")
+    args = ap.parse_args()
+    if args.no_support_mask:
+        args.support_rel_var = None
+    return args
 
 
 def main():
@@ -569,39 +718,55 @@ def main():
     if not paths:
         raise FileNotFoundError(f"No files matched: {os.path.join(indir, args.pattern)}")
 
-    # Group by (n_qubits, n_layers)
+    # Group so that the swept quantity (column_axis) varies across columns while
+    # the other structural parameter is held fixed within a figure.
+    #   column_axis="depth"  -> group by (n_qubits, n_layers),   columns = depths
+    #   column_axis="layers" -> group by (n_qubits, train_depth), columns = layers
+    col_is_layers = (args.column_axis == "layers")
     groups = {}
     for p in paths:
         d, meta, diag = load_npz_strict(p)
-        key = (int(d["n_qubits"]), int(d["n_layers"]))
+        if col_is_layers:
+            key = (int(d["n_qubits"]), int(d["train_depth"]))
+        else:
+            key = (int(d["n_qubits"]), int(d["n_layers"]))
         groups.setdefault(key, []).append((p, d, meta, diag))
 
-    summary = {"indir": indir, "pattern": args.pattern, "groups": []}
+    summary = {"indir": indir, "pattern": args.pattern, "column_axis": args.column_axis, "groups": []}
 
-    for (n_qubits, n_layers), items in sorted(groups.items()):
+    for (n_qubits, fixed_val), items in sorted(groups.items()):
         rows = []
         omega_grid_complex = None
 
         for (p, d, meta, diag) in items:
             depth = int(d["train_depth"])
+            n_layers_r = int(d["n_layers"])
+            col_value = n_layers_r if col_is_layers else depth
             if omega_grid_complex is None:
                 omega_grid_complex = d["omega_grid"].astype(int)
 
             rows.append({
                 "path": p,
                 "depth": depth,
+                "n_layers": n_layers_r,
+                "col_value": col_value,
                 "Corr_C": d["Corr_C"],
                 "Corr_MC": d["Corr_MC"],
                 "var_C": d["var_C"],
                 "var_MC": d["var_MC"],
+                "samples_MC": d["samples_MC"] if "samples_MC" in d.files else None,
                 "diag": diag,
             })
 
-        rows.sort(key=lambda r: r["depth"])
-        title_prefix = f"n={n_qubits}, L={n_layers}"
-        depths_str = "_".join(str(r["depth"]) for r in rows)
-
-        base = f"grid_n{n_qubits}_L{n_layers}_depths_{depths_str}_side{args.omega_side}_diag{args.mask_diag}"
+        rows.sort(key=lambda r: r["col_value"])
+        col_label = "L" if col_is_layers else "depth"
+        vals_str = "_".join(str(r["col_value"]) for r in rows)
+        if col_is_layers:
+            title_prefix = f"n={n_qubits}, d={fixed_val}"
+            base = f"grid_n{n_qubits}_d{fixed_val}_layers_{vals_str}_side{args.omega_side}_diag{args.mask_diag}"
+        else:
+            title_prefix = f"n={n_qubits}, L={fixed_val}"
+            base = f"grid_n{n_qubits}_L{fixed_val}_depths_{vals_str}_side{args.omega_side}_diag{args.mask_diag}"
         if args.support_rel_var is not None:
             base += f"_supp{args.support_rel_var:.0e}_{args.support_mode}"
 
@@ -613,30 +778,37 @@ def main():
             rows, omega_grid_complex, title_prefix, out_re,
             part="real", clip_q=args.clip_q, omega_phys=args.omega_phys,
             omega_side=args.omega_side, mask_diag=args.mask_diag,
-            support_rel_var=args.support_rel_var, support_mode=args.support_mode
+            support_rel_var=args.support_rel_var, support_mode=args.support_mode,
+            unit_diag_white=args.unit_diag_white, col_label=col_label,
+            n_bootstrap=args.n_bootstrap, bootstrap_seed=args.bootstrap_seed,
         )
         plot_grid_figure_hermitian(
             rows, omega_grid_complex, title_prefix, out_im,
             part="imag", clip_q=args.clip_q, omega_phys=args.omega_phys,
             omega_side=args.omega_side, mask_diag=args.mask_diag,
-            support_rel_var=args.support_rel_var, support_mode=args.support_mode
+            support_rel_var=args.support_rel_var, support_mode=args.support_mode,
+            unit_diag_white=args.unit_diag_white, col_label=col_label,
+            n_bootstrap=args.n_bootstrap, bootstrap_seed=args.bootstrap_seed,
         )
         plot_grid_figure_hermitian(
             rows, omega_grid_complex, title_prefix, out_abs,
             part="abs", clip_q=args.clip_q, omega_phys=args.omega_phys,
             omega_side=args.omega_side, mask_diag=args.mask_diag,
-            support_rel_var=args.support_rel_var, support_mode=args.support_mode
+            support_rel_var=args.support_rel_var, support_mode=args.support_mode,
+            unit_diag_white=args.unit_diag_white, col_label=col_label,
+            n_bootstrap=args.n_bootstrap, bootstrap_seed=args.bootstrap_seed,
         )
 
-        print(f"[OK] Group n={n_qubits}, L={n_layers}: wrote")
+        print(f"[OK] Group {title_prefix}: wrote")
         for outp in [out_re, out_im, out_abs]:
             print(f"     {os.path.basename(outp)}")
 
         summary["groups"].append({
             "n_qubits": int(n_qubits),
-            "n_layers": int(n_layers),
+            "fixed": ({"train_depth": int(fixed_val)} if col_is_layers else {"n_layers": int(fixed_val)}),
+            "column_axis": args.column_axis,
             "n_cols": len(rows),
-            "depths": [r["depth"] for r in rows],
+            "col_values": [r["col_value"] for r in rows],
             "complex_real": os.path.basename(out_re),
             "complex_imag": os.path.basename(out_im),
             "complex_abs": os.path.basename(out_abs),
